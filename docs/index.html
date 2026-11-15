@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MintGuard — mint-safety verification agent for .ai Agent IDs</title>
+<style>
+  body{font-family:system-ui,-apple-system,sans-serif;max-width:780px;margin:2em auto;padding:0 1em;line-height:1.55;color:#1a1a1a}
+  input,button{font-size:1em;padding:.55em} input{width:100%;box-sizing:border-box;margin:.25em 0 .6em}
+  button{cursor:pointer} pre{background:#111;color:#e8e8e8;padding:1em;overflow:auto;border-radius:8px;font-size:.85em}
+  .go{color:#0a7d2c}.caution{color:#9a6a00}.block{color:#b00020}
+  .check{border:1px solid #ddd;border-radius:8px;padding:.6em .8em;margin:.5em 0}
+  .check b{text-transform:uppercase;font-size:.8em}
+  .pass b{color:#0a7d2c}.warn b{color:#9a6a00}.fail b{color:#b00020}.unknown b{color:#666}
+  .muted{color:#666;font-size:.9em}
+</style>
+</head>
+<body>
+<h1>MintGuard</h1>
+<p>A mint-safety verification agent for <b>.ai Agent IDs</b> on BSC. Give it a mint contract and it checks, live: is the contract real and source-verified, is the mint open or paused, what is the exact mint price, is supply capped, is the owner renounced — and whether the project's X account exists. It answers <b>GO / CAUTION / BLOCK</b> with evidence for every check.</p>
+<p class="muted">This page runs the whole agent in your browser (no server, no wallet, no signing). It reads only public data: BSC public RPC, Sourcify v2, and the project's X profile page. A check that cannot be performed is reported as <i>unknown</i>, never as clean. The same logic also runs as a Node server — see the repo.</p>
+
+<h2>Verify a mint</h2>
+<form id="f">
+  <label>BSC contract address<br><input name="contract" value="0x6288DFe86f22B53eEB6886aE2D78941de7483743" required></label>
+  <label>Expected price in BNB (optional — a mismatch with the contract price = BLOCK)<br><input name="expectedPrice" placeholder="0 for a free mint"></label>
+  <label>Project X handle (optional, without @)<br><input name="xHandle" placeholder="e.g. PokechainTrade"></label>
+  <button type="submit">Verify mint</button>
+</form>
+<p class="muted">Demo contracts:
+  <a href="#" data-c="0x6288DFe86f22B53eEB6886aE2D78941de7483743">AGCC mint</a> ·
+  <a href="#" data-c="0x4EF929aF00cB93993c3D01834C4DA79200d31e32">Pokechain</a> ·
+  <a href="#" data-c="0xDAf554230466979b65c247E1A73F3e0C24595c6D">MetaFishtank fish</a> ·
+  <a href="#" data-c="0x0000000000000000000000000000000000000000">zero address (must BLOCK)</a>
+</p>
+<div id="out"></div>
+
+<script>
+// ---- MintGuard (browser build). Same probes + scoring as the Node server. ----
+const RPCS = ["https://bsc-dataseed.binance.org", "https://bsc-rpc.publicnode.com", "https://1rpc.io/bnb"];
+const SEL = { owner:"8da5cb5b", paused:"5c975abb", totalSupply:"18160ddd", maxSupply:"d5abeb01",
+  totalMinted:"a2309ff8", mintPrice:"6817c76c", MINT_PRICE:"c002d23d", cost:"13faede6", PRICE:"8d859f3e",
+  ownerOf:"6352211e", tokenURI:"c87b56dd", royaltyInfo:"2a55205a", saleIsActive:"eb8d2444",
+  publicSaleActive:"bc8893b4", baseURI:"6c0360eb", name:"06fdde03", symbol:"95d89b41",
+  revealed:"51830227", isRevealed:"54214f69", mint1:"a0712d68" };
+const ZERO = "0x0000000000000000000000000000000000000000";
+const ONE = 10n ** 18n;
+const EIP1967 = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
+
+async function rpc(method, params) {
+  let err = null;
+  for (const url of RPCS) {
+    try {
+      const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error.message || "rpc error");
+      return j.result;
+    } catch (e) { err = e; }
+  }
+  throw new Error("all BSC RPCs failed: " + (err && err.message));
+}
+async function rpcBatch(calls, blockTag) {
+  const payload = calls.map((c, i) => ({ jsonrpc: "2.0", id: i, method: "eth_call",
+    params: [{ to: c.to, data: c.data, value: c.value || "0x0" }, blockTag] }));
+  let err = null;
+  for (const url of RPCS) {
+    try {
+      const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+      const j = await r.json();
+      const arr = Array.isArray(j) ? j : [j];
+      return arr.map((x) => x.error ? { ok: false, error: x.error.message || "", data: x.error.data || null } : { ok: true, result: x.result });
+    } catch (e) { err = e; }
+  }
+  throw new Error("all BSC RPCs failed (batch): " + (err && err.message));
+}
+const encU = (v) => BigInt(v).toString(16).padStart(64, "0");
+const decU = (h) => (!h || h === "0x") ? null : BigInt(h);
+const decA = (h) => (!h || h === "0x" || h.length < 42) ? null : "0x" + h.slice(-40);
+const decB = (h) => (!h || h === "0x") ? null : BigInt(h) !== 0n;
+function hexToBytes(hex) { const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16); return out; }
+function decS(h) { if (!h || h === "0x" || h.length < 130) return null;
+  try { const b = h.slice(2); const len = parseInt(b.slice(64, 128), 16);
+    return new TextDecoder().decode(hexToBytes(b.slice(128, 128 + len * 2))); } catch { return null; } }
+function decRevert(d) { if (!d || typeof d !== "string") return null;
+  const h = d.startsWith("0x") ? d.slice(2) : d; if (!h.startsWith("08c379a0")) return null;
+  try { const b = h.slice(8); const len = parseInt(b.slice(64, 128), 16);
+    return new TextDecoder().decode(hexToBytes(b.slice(128, 128 + len * 2))); } catch { return null; } }
+function weiToBnb(w) { const whole = w / ONE, frac = w % ONE;
+  const f = frac.toString().padStart(18, "0").slice(0, 6).replace(/0+$/, "");
+  return f ? whole + "." + f : String(whole); }
+
+async function checkSource(addrLc) {
+  const url = "https://sourcify.dev/server/v2/contract/56/" + addrLc;
+  try {
+    const r = await fetch(url);
+    if (r.status === 404) return { id: "source_verified", label: "Source verified (Sourcify)", status: "warn",
+      detail: "Contract source is NOT verified on Sourcify — the code behind the mint cannot be read.", evidence: url + " -> HTTP 404" };
+    if (!r.ok) return { id: "source_verified", label: "Source verified (Sourcify)", status: "unknown",
+      detail: "Sourcify lookup failed (HTTP " + r.status + ").", evidence: url + " -> HTTP " + r.status };
+    const j = await r.json();
+    const c = j.creationMatch, rt = j.runtimeMatch;
+    if (c === "perfect" || rt === "perfect" || c === "match" || rt === "match")
+      return { id: "source_verified", label: "Source verified (Sourcify)", status: "pass",
+        detail: "Source verified (creation: " + c + ", runtime: " + rt + ") — the mint code can be read and re-checked.", evidence: url + " -> creationMatch=" + c + " runtimeMatch=" + rt };
+    if (c === "partial" || rt === "partial")
+      return { id: "source_verified", label: "Source verified (Sourcify)", status: "warn",
+        detail: "Source is only a partial match — metadata differs, so constants may not match the deployed bytecode.", evidence: url + " -> creationMatch=" + c + " runtimeMatch=" + rt };
+    return { id: "source_verified", label: "Source verified (Sourcify)", status: "warn",
+      detail: "Sourcify answered but reported no match.", evidence: url + " -> creationMatch=" + c + " runtimeMatch=" + rt };
+  } catch (e) {
+    return { id: "source_verified", label: "Source verified (Sourcify)", status: "unknown",
+      detail: "Sourcify lookup errored (" + e.message + ").", evidence: url + " -> error" };
+  }
+}
+
+async function checkX(handle) {
+  const clean = String(handle).replace(/^@/, "").trim();
+  if (!/^[A-Za-z0-9_]{1,15}$/.test(clean))
+    return { id: "x_recycle", label: "X account recycle check", status: "unknown", detail: "Invalid handle format.", evidence: "handle=" + handle };
+  const url = "https://x.com/" + clean;
+  try {
+    const r = await fetch(url, { headers: { "accept": "text/html" } });
+    const t = (await r.text()).toLowerCase();
+    if (r.status === 404) return { id: "x_recycle", label: "X account recycle check", status: "fail",
+      detail: "X account @" + clean + " does not exist (X returns HTTP 404).", evidence: url + " -> HTTP 404" };
+    if (t.includes("this account doesn") || t.includes("doesn't exist"))
+      return { id: "x_recycle", label: "X account recycle check", status: "fail",
+        detail: "X account @" + clean + " does not exist.", evidence: url + " -> page says the account does not exist" };
+    return { id: "x_recycle", label: "X account recycle check", status: "warn",
+      detail: "X account @" + clean + " exists, but its history (previous names, rebrands, old projects) could not be verified from the public page — treat as UNVERIFIED, not clean.", evidence: url + " -> HTTP " + r.status + ", profile page loads" };
+  } catch (e) {
+    return { id: "x_recycle", label: "X account recycle check", status: "unknown",
+      detail: "X profile for @" + clean + " could not be fetched from this browser (X blocks cross-origin reads) — history is UNVERIFIED, not clean. The server build checks it directly.", evidence: url + " -> fetch blocked (" + e.message + ")" };
+  }
+}
+
+const HARD = new Set(["contract_exists", "paused", "mint_price", "sale_state", "mint_entry", "x_recycle"]);
+const DED = { source_verified: { warn: 20, unknown: 10 }, owner: { warn: 10 }, proxy: { warn: 5 },
+  supply_cap: { warn: 10, unknown: 5 }, mint_price: { warn: 10 }, sale_state: { unknown: 5 },
+  mint_entry: { unknown: 5 }, royalty: { warn: 10 }, reveal: { warn: 5 }, x_recycle: { warn: 5, unknown: 5 } };
+function score(checks) {
+  let s = 100; const reasons = []; let hard = null;
+  for (const c of checks) {
+    if (c.status === "fail" && HARD.has(c.id)) hard = c;
+    const d = DED[c.id]; if (d && d[c.status]) { s -= d[c.status]; reasons.push("-" + d[c.status] + " " + c.id + " (" + c.status + ")"); }
+  }
+  s = Math.max(0, s);
+  if (hard) return { score: s, verdict: "BLOCK", reason: "Hard block: " + hard.label + " — " + hard.detail };
+  if (s >= 85) return { score: s, verdict: "GO", reason: reasons.length ? "Score " + s + "/100 with notes: " + reasons.join("; ") : "Score " + s + "/100 — all checks clear." };
+  if (s >= 55) return { score: s, verdict: "CAUTION", reason: "Score " + s + "/100 — proceed only after acknowledging: " + reasons.join("; ") };
+  return { score: s, verdict: "BLOCK", reason: "Score " + s + "/100 — too many unresolved risks: " + reasons.join("; ") };
+}
+
+async function verify(contract, expectedPrice, xHandle) {
+  const addr = contract, addrLc = addr.toLowerCase();
+  const block = parseInt(await rpc("eth_blockNumber", []), 16);
+  const tag = "0x" + block.toString(16);
+  const checks = [];
+  let code;
+  try { code = await rpc("eth_getCode", [addr, tag]); } catch (e) {
+    checks.push({ id: "contract_exists", label: "Contract exists on BSC", status: "unknown", detail: "eth_getCode failed (" + e.message + ").", evidence: "eth_getCode -> error" });
+  }
+  if (code !== undefined) {
+    if (code === "0x" || code === "0x0") {
+      checks.push({ id: "contract_exists", label: "Contract exists on BSC", status: "fail",
+        detail: "No code at this address — it is an EOA or an undeployed address, not a mint contract.", evidence: "eth_getCode @ block " + block + " -> 0x" });
+      return { contract: addr, block, checks };
+    }
+    checks.push({ id: "contract_exists", label: "Contract exists on BSC", status: "pass",
+      detail: "Contract code present (" + (code.length / 2 - 1).toLocaleString() + " bytes) at block " + block + ".", evidence: "eth_getCode @ block " + block });
+  }
+  try {
+    const slot = await rpc("eth_getStorageAt", [addr, EIP1967, tag]);
+    if (slot && slot !== "0x" + "0".repeat(64)) {
+      const impl = "0x" + slot.slice(-40);
+      if (impl.toLowerCase() !== addrLc)
+        checks.push({ id: "proxy", label: "Proxy / implementation", status: "warn",
+          detail: "This is a proxy pointing at implementation " + impl + ". The implementation is what actually runs the mint.", evidence: "EIP1967 slot @ block " + block + " -> " + impl });
+    }
+  } catch (e) {
+    checks.push({ id: "proxy", label: "Proxy / implementation", status: "unknown", detail: "Proxy slot read failed.", evidence: "eth_getStorageAt -> error" });
+  }
+  const noArg = (s) => ({ to: addr, data: "0x" + s });
+  const calls = [
+    { key: "owner", ...noArg(SEL.owner) }, { key: "paused", ...noArg(SEL.paused) },
+    { key: "totalSupply", ...noArg(SEL.totalSupply) }, { key: "maxSupply", ...noArg(SEL.maxSupply) },
+    { key: "totalMinted", ...noArg(SEL.totalMinted) }, { key: "mintPrice", ...noArg(SEL.mintPrice) },
+    { key: "MINT_PRICE", ...noArg(SEL.MINT_PRICE) }, { key: "cost", ...noArg(SEL.cost) },
+    { key: "PRICE", ...noArg(SEL.PRICE) }, { key: "saleIsActive", ...noArg(SEL.saleIsActive) },
+    { key: "publicSaleActive", ...noArg(SEL.publicSaleActive) }, { key: "name", ...noArg(SEL.name) },
+    { key: "symbol", ...noArg(SEL.symbol) }, { key: "revealed", ...noArg(SEL.revealed) },
+    { key: "isRevealed", ...noArg(SEL.isRevealed) },
+    { key: "ownerOf1", to: addr, data: "0x" + SEL.ownerOf + encU(1) },
+    { key: "tokenURI1", to: addr, data: "0x" + SEL.tokenURI + encU(1) },
+    { key: "royaltyInfo", to: addr, data: "0x" + SEL.royaltyInfo + encU(1) + encU(ONE) },
+    { key: "mintEntry", to: addr, data: "0x" + SEL.mint1 + encU(1), value: "0x0" },
+  ];
+  const [src, batch] = await Promise.all([checkSource(addrLc), rpcBatch(calls, tag).catch((e) => ({ __error: e.message }))]);
+  checks.push(src);
+  if (batch.__error) {
+    checks.push({ id: "onchain_reads", label: "On-chain reads", status: "unknown", detail: "Batched eth_call reads failed (" + batch.__error + ").", evidence: "eth_call batch @ block " + block });
+    return { contract: addr, block, checks };
+  }
+  const oc = {}; calls.forEach((c, i) => { oc[c.key] = batch[i]; });
+  const o = oc.owner;
+  if (o.ok) { const ow = decA(o.result);
+    if (ow === ZERO) checks.push({ id: "owner", label: "Ownership renounced", status: "pass", detail: "owner() returns the zero address — every onlyOwner function is inert.", evidence: "owner() @ block " + block + " -> 0x0000…0000" });
+    else if (ow) checks.push({ id: "owner", label: "Ownership renounced", status: "warn", detail: "owner() is live at " + ow + " — an owner can still call privileged functions unless the source proves otherwise.", evidence: "owner() @ block " + block + " -> " + ow });
+    else checks.push({ id: "owner", label: "Ownership renounced", status: "unknown", detail: "owner() returned undecodable data.", evidence: "owner() -> " + String(o.result).slice(0, 66) });
+  } else checks.push({ id: "owner", label: "Ownership renounced", status: "unknown", detail: "owner() does not exist or reverted.", evidence: "owner() -> reverted" });
+  const p = oc.paused;
+  if (p.ok) { const pa = decB(p.result);
+    if (pa === true) checks.push({ id: "paused", label: "Mint paused?", status: "fail", detail: "paused() is true — the contract is paused.", evidence: "paused() -> true" });
+    else if (pa === false) checks.push({ id: "paused", label: "Mint paused?", status: "pass", detail: "paused() is false.", evidence: "paused() -> false" });
+    else checks.push({ id: "paused", label: "Mint paused?", status: "unknown", detail: "paused() returned undecodable data.", evidence: "paused()" });
+  } else checks.push({ id: "paused", label: "Mint paused?", status: "unknown", detail: "No paused() function.", evidence: "paused() -> reverted / absent" });
+  const isNft = (oc.ownerOf1 && oc.ownerOf1.ok) || (oc.tokenURI1 && oc.tokenURI1.ok);
+  const ts = oc.totalSupply.ok ? decU(oc.totalSupply.result) : null;
+  const ms = oc.maxSupply.ok ? decU(oc.maxSupply.result) : null;
+  const tm = oc.totalMinted.ok ? decU(oc.totalMinted.result) : null;
+  const minted = tm !== null ? tm : ts;
+  checks.push({ id: "type", label: "Asset type", status: "pass",
+    detail: isNft ? "Behaves as an NFT collection. Minted: " + (minted !== null ? minted.toString() : "unknown") + (ms !== null && ms !== 0n ? " / maxSupply " + ms.toString() : " / maxSupply uncapped or absent") + "."
+      : "Does not answer ownerOf(1)/tokenURI(1) — likely a token or custom mint contract. totalSupply: " + (ts !== null ? ts.toString() : "unknown") + ".",
+    evidence: "ownerOf(1) " + (oc.ownerOf1.ok ? "ok" : "revert") + "; tokenURI(1) " + (oc.tokenURI1.ok ? "ok" : "revert") });
+  if (ms !== null && ms === 0n) checks.push({ id: "supply_cap", label: "Supply capped", status: "warn", detail: "maxSupply() is 0 — supply is uncapped.", evidence: "maxSupply() -> 0" });
+  else if (ms !== null && ms > 0n) checks.push({ id: "supply_cap", label: "Supply capped", status: "pass", detail: "maxSupply() is " + ms.toString() + " — supply is bounded.", evidence: "maxSupply() -> " + ms.toString() });
+  else checks.push({ id: "supply_cap", label: "Supply capped", status: "unknown", detail: "maxSupply() does not exist or reverted.", evidence: "maxSupply() -> reverted / absent" });
+  let priceWei = null, priceFn = null;
+  for (const [n, r] of [["mintPrice", oc.mintPrice], ["MINT_PRICE", oc.MINT_PRICE], ["cost", oc.cost], ["PRICE", oc.PRICE]]) {
+    if (r && r.ok) { const v = decU(r.result); if (v !== null) { priceWei = v; priceFn = n; break; } }
+  }
+  if (priceWei !== null) {
+    const bnb = weiToBnb(priceWei); let st = "pass";
+    let detail = priceFn + "() is " + priceWei.toString() + " wei = " + bnb + " BNB (" + (priceWei === 0n ? "FREE mint, gas only" : "paid mint") + ").";
+    if (expectedPrice) { const exp = BigInt(Math.round(parseFloat(expectedPrice) * 1e18));
+      if (exp !== priceWei) { st = "fail"; detail += " MISMATCH: expected " + expectedPrice + " BNB but the contract charges " + bnb + " BNB."; }
+      else detail += " Matches the expected price of " + expectedPrice + " BNB."; }
+    checks.push({ id: "mint_price", label: "Mint price", status: st, detail, evidence: priceFn + "() @ block " + block + " -> " + priceWei.toString() + " wei" });
+  } else checks.push({ id: "mint_price", label: "Mint price", status: "warn", detail: "No mintPrice()/MINT_PRICE()/cost()/PRICE() getter answered — free vs paid is unknown.", evidence: "price getters -> all reverted / absent" });
+  const sale = oc.saleIsActive.ok ? decB(oc.saleIsActive.result) : oc.publicSaleActive.ok ? decB(oc.publicSaleActive.result) : null;
+  const saleFn = oc.saleIsActive.ok ? "saleIsActive" : oc.publicSaleActive.ok ? "publicSaleActive" : null;
+  if (sale === true) checks.push({ id: "sale_state", label: "Sale open?", status: "pass", detail: saleFn + "() is true — the public sale is open.", evidence: saleFn + "() -> true" });
+  else if (sale === false) checks.push({ id: "sale_state", label: "Sale open?", status: "fail", detail: saleFn + "() is false — the sale is closed.", evidence: saleFn + "() -> false" });
+  else checks.push({ id: "sale_state", label: "Sale open?", status: "unknown", detail: "No saleIsActive()/publicSaleActive() function.", evidence: "sale state -> reverted / absent" });
+  const me = oc.mintEntry;
+  if (me.ok) checks.push({ id: "mint_entry", label: "Mint entry reachable", status: "pass", detail: "A static call to mint(1) with 0 value SUCCEEDED — the mint entry is live.", evidence: "eth_call mint(1) value=0 -> success" });
+  else {
+    const reason = decRevert(me.data); const msg = (me.error || "") + (reason ? " (" + reason + ")" : "");
+    if (/not active|not started|not open|sale.*closed|paused/i.test(msg)) checks.push({ id: "mint_entry", label: "Mint entry reachable", status: "fail", detail: "mint(1) reverts with a sale-gate reason: \"" + (reason || me.error) + "\" — the mint is not open.", evidence: "eth_call mint(1) -> revert" });
+    else if (/insufficient|payment|price|value|fund|allowance|balance/i.test(msg)) checks.push({ id: "mint_entry", label: "Mint entry reachable", status: "pass", detail: "mint(1) reverts only on payment (\"" + (reason || me.error) + "\") — the entry exists and is reachable.", evidence: "eth_call mint(1) -> revert (payment)" });
+    else checks.push({ id: "mint_entry", label: "Mint entry reachable", status: "unknown", detail: "mint(1) reverted without a readable reason — the entry may exist but is gated, or may not exist.", evidence: "eth_call mint(1) -> revert, no reason decoded" });
+  }
+  const ri = oc.royaltyInfo;
+  if (ri.ok) { try { const amount = BigInt("0x" + ri.result.slice(2).slice(64, 128));
+      const pct = Number((amount * 10000n) / ONE) / 100;
+      checks.push({ id: "royalty", label: "Resale royalty (EIP-2981)", status: pct > 10 ? "warn" : "pass",
+        detail: "royaltyInfo(1, 1 BNB) is " + pct + "%" + (pct > 10 ? " — above 10%, which eats resale margin." : " — within the normal range."), evidence: "royaltyInfo(1, 1e18) -> " + amount.toString() + " wei" });
+    } catch { checks.push({ id: "royalty", label: "Resale royalty (EIP-2981)", status: "unknown", detail: "royaltyInfo() answered but the return could not be decoded.", evidence: "royaltyInfo()" }); } }
+  const rev = oc.revealed.ok ? decB(oc.revealed.result) : oc.isRevealed.ok ? decB(oc.isRevealed.result) : null;
+  if (rev !== null) checks.push({ id: "reveal", label: "Art revealed?", status: rev ? "pass" : "warn",
+    detail: rev ? "revealed() is true." : "revealed() is false — art is still hidden; unrevealed with no deadline is a risk.", evidence: "revealed()/isRevealed() -> " + rev });
+  const name = oc.name.ok ? decS(oc.name.result) : null;
+  const symbol = oc.symbol.ok ? decS(oc.symbol.result) : null;
+  if (name || symbol) checks.push({ id: "identity", label: "Collection identity", status: "pass",
+    detail: "name() = \"" + (name || "?") + "\" · symbol() = \"" + (symbol || "?") + "\".", evidence: "name()/symbol()" });
+  if (xHandle) checks.push(await checkX(xHandle));
+  return { contract: addr, block, checks };
+}
+
+const f = document.getElementById("f"), out = document.getElementById("out");
+document.querySelectorAll("[data-c]").forEach((a) => a.onclick = (e) => { e.preventDefault(); f.contract.value = a.dataset.c; });
+f.onsubmit = async (e) => {
+  e.preventDefault();
+  const contract = f.contract.value.trim();
+  if (!/^0x[0-9a-fA-F]{40}$/.test(contract)) { out.innerHTML = "<p class='block'>Contract must be a 0x + 40-hex BSC address.</p>"; return; }
+  out.innerHTML = "<p>Checking live on-chain… (BSC RPC + Sourcify + X)</p>";
+  const t0 = Date.now();
+  try {
+    const r = await verify(contract, f.expectedPrice.value.trim() || null, f.xHandle.value.trim() || null);
+    const s = score(r.checks);
+    const cls = s.verdict === "GO" ? "go" : s.verdict === "CAUTION" ? "caution" : "block";
+    out.innerHTML = "<h2 class='" + cls + "'>Verdict: " + s.verdict + " — " + s.score + "/100</h2>"
+      + "<p>" + s.reason + "</p>"
+      + "<p class='muted'>Block " + r.block + " · checked in " + (Date.now() - t0) + "ms · " + new Date().toISOString() + "</p>"
+      + r.checks.map((c) => "<div class='check " + c.status + "'><b>" + c.status + "</b> — " + c.label + "<br>" + c.detail + "<br><span class='muted'>" + c.evidence + "</span></div>").join("")
+      + "<h3>Raw JSON</h3><pre>" + JSON.stringify({ agent: "MintGuard", verdict: s.verdict, score: s.score, contract: r.contract, chain: "BSC (56)", block: r.block, checks: r.checks }, null, 2) + "</pre>";
+  } catch (err) {
+    out.innerHTML = "<p class='block'>Check failed: " + err.message + "</p>";
+  }
+};
+</script>
+<h2>How it works</h2>
+<p>MintGuard runs 10+ live probes per mint and scores them into a verdict (GO ≥ 85, CAUTION 55–84, BLOCK &lt; 55 or any hard block). Hard blocks: no code at the address, contract paused, listed price ≠ contract price, sale closed, mint gated, or the linked X account does not exist. Every verdict is reproducible from the pinned block in the response. Read-only: it never signs, never spends, never touches a wallet.</p>
+<p>Built for the zkVerify Agent Games — Wildcard track. Full source + Node server: <a href="https://github.com/ncyrmd/mintguard-agent">github.com/ncyrmd/mintguard-agent</a>. Reference only, not investment advice.</p>
+</body>
+</html>
